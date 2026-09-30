@@ -107,7 +107,16 @@ def reset_if_new_day(game_state, current_date):
 def check_mathematical_elimination(game_state):
     """
     Dynamically calculates if a sub-counter group
-    is mathematically impossible to win.
+    is mathematically impossible to lose.
+
+    A game counts as completed only when:
+      1. Both players have submitted and the result is resolved, OR
+      2. Only one player submitted AND the game's target minute has
+         completely passed, meaning the other player forfeited by
+         non-submission.
+
+    Provisional games that are still inside their target minute
+    do NOT count as completed.
     """
 
     for counter, max_slots in COUNTER_MAX_POINTS.items():
@@ -124,12 +133,14 @@ def check_mathematical_elimination(game_state):
 
         for m_id, m_data in game_state["matches"].items():
 
-            if m_id in TARGET_GAMES:
+            if m_id not in TARGET_GAMES:
+                continue
 
-                if counter in TARGET_GAMES[m_id]["counters"]:
+            if counter not in TARGET_GAMES[m_id]["counters"]:
+                continue
 
-                    if "winner" in m_data:
-                        slots_played += 1
+            if m_data.get("resolved") is True:
+                slots_played += 1
 
         remaining_slots = max_slots - slots_played
 
@@ -152,6 +163,74 @@ def check_mathematical_elimination(game_state):
                 f"{counter.upper()} is mathematically FINAL. "
                 f"Mitchell wins the bracket!"
             )
+
+
+def finalize_expired_games(game_state, current_dt):
+    """
+    Finalize games where only one player submitted and the game's
+    entire target minute has now passed.
+
+    Example:
+        12:24 game
+        Mitchell submitted
+        Avery did not
+
+    Once the clock reaches 12:25 or later, Mitchell's provisional
+    point becomes final.
+
+    If both players submitted, the normal sent_at comparison
+    handles resolution instead.
+    """
+
+    changed = False
+
+    for game_name, target in TARGET_GAMES.items():
+
+        if game_name not in game_state["matches"]:
+            continue
+
+        match_data = game_state["matches"][game_name]
+
+        if match_data.get("resolved") is True:
+            continue
+
+        players = [player for player in ("Avery", "Mitchell") if player in match_data]
+
+        if len(players) != 1:
+            continue
+
+        target_end = current_dt.replace(
+            hour=target["hour"],
+            minute=target["minute"],
+            second=59,
+            microsecond=999999,
+        )
+
+        if current_dt <= target_end:
+            continue
+
+        winner = players[0]
+
+        match_data["winner"] = winner
+        match_data["winner_timestamp_ms"] = match_data[winner]["timestamp_ms"]
+        match_data["winner_sent_at"] = match_data[winner]["sent_at"]
+        match_data["winner_readable_time"] = match_data[winner]["readable_time"]
+        match_data["winner_text"] = match_data[winner]["text"]
+
+        match_data["winner_reason"] = "no_opponent_submission"
+        match_data["resolved"] = True
+
+        print("\n" + "⏱️" * 15)
+        print(f"⏱️ GAME FINALIZED BY NON-SUBMISSION")
+        print(f"🎯 GAME: {game_name.upper()}")
+        print(f"🏆 WINNER: {winner}")
+        print("📲 Only one player submitted.")
+        print("⏰ The entire game minute has passed.")
+        print("⏱️" * 15 + "\n")
+
+        changed = True
+
+    return changed
 
 
 def parse_sent_at(sent_at_raw):
@@ -485,6 +564,7 @@ def text_drop():
             game_state = reset_if_new_day(
                 game_state, sent_at_local.strftime("%Y-%m-%d")
             )
+            finalize_expired_games(game_state, sent_at_local)
 
             for counter in counters:
 
@@ -599,6 +679,7 @@ def text_drop():
         game_state = load_data()
 
         game_state = reset_if_new_day(game_state, sent_at_local.strftime("%Y-%m-%d"))
+        finalize_expired_games(game_state, sent_at_local)
 
         for counter in counters:
 
@@ -683,6 +764,7 @@ def text_drop():
             match_data["winner_text"] = match_data[winner]["text"]
 
             match_data["winner_reason"] = "provisional_first_received"
+            match_data["resolved"] = False
 
             game_state["scores"][winner] += 1
 
@@ -722,28 +804,76 @@ def text_drop():
                         "game": matched_game,
                         "winner_sent_at": match_data[winner]["sent_at"],
                         "winner_timestamp_ms": winner_ms,
+                        "margin_ms": None,
                     }
                 ),
                 200,
             )
 
         avery_ms = match_data["Avery"]["timestamp_ms"]
-
         mitchell_ms = match_data["Mitchell"]["timestamp_ms"]
 
         if avery_ms < mitchell_ms:
-
             winner = "Avery"
-
         elif mitchell_ms < avery_ms:
-
             winner = "Mitchell"
-
         else:
+            winner = None
+            print("⚠️ EXACT TIMESTAMP TIE. NO POINT AWARDED.")
 
-            winner = "Avery"
+        margin_ms = abs(avery_ms - mitchell_ms)
+        match_data["margin_ms"] = margin_ms
 
-            print("⚠️ EXACT TIMESTAMP TIE. " "Defaulting to Avery.")
+        if winner is None:
+            previous_winner = match_data.get("winner")
+
+            if previous_winner is not None:
+                game_state["scores"][previous_winner] -= 1
+
+                for counter in counters:
+                    if counter not in game_state["counter_scores"]:
+                        game_state["counter_scores"][counter] = {
+                            "Avery": 0,
+                            "Mitchell": 0,
+                        }
+
+                    game_state["counter_scores"][counter][previous_winner] -= 1
+
+            match_data["winner"] = None
+            match_data["winner_timestamp_ms"] = None
+            match_data["winner_sent_at"] = None
+            match_data["winner_readable_time"] = None
+            match_data["winner_text"] = None
+            match_data["winner_reason"] = "exact_timestamp_tie"
+            match_data["resolved"] = True
+
+            check_mathematical_elimination(game_state)
+            save_data(game_state)
+
+            print("\n" + "🤝" * 15)
+            print("🤝 EXACT TIMESTAMP TIE")
+            print(f"🎯 GAME: {matched_game.upper()}")
+            print(f"📱 Avery:    {match_data['Avery']['readable_time']}")
+            print(f"📱 Mitchell: {match_data['Mitchell']['readable_time']}")
+            print("⚖️ NO POINT AWARDED")
+            print("🤝" * 15 + "\n")
+
+            return (
+                jsonify(
+                    {
+                        "status": "received",
+                        "result": "exact_timestamp_tie",
+                        "winner": None,
+                        "previous_winner": previous_winner,
+                        "game": matched_game,
+                        "winner_sent_at": None,
+                        "winner_timestamp_ms": None,
+                        "margin_ms": 0,
+                        "resolved": True,
+                    }
+                ),
+                200,
+            )
 
         winner_ms = match_data[winner]["timestamp_ms"]
 
@@ -762,6 +892,8 @@ def text_drop():
             match_data["winner_text"] = match_data[winner]["text"]
 
             match_data["winner_reason"] = "earlier_sent_at_confirmed"
+
+            match_data["resolved"] = True
 
             check_mathematical_elimination(game_state)
 
@@ -792,6 +924,8 @@ def text_drop():
                         "game": matched_game,
                         "winner_sent_at": match_data[winner]["sent_at"],
                         "winner_timestamp_ms": winner_ms,
+                        "margin_ms": margin_ms,
+                        "resolved": True,
                     }
                 ),
                 200,
@@ -843,6 +977,8 @@ def text_drop():
 
         match_data["winner_reason"] = "earlier_sent_at_overrode_provisional_winner"
 
+        match_data["resolved"] = True
+
         check_mathematical_elimination(game_state)
 
         save_data(game_state)
@@ -861,6 +997,8 @@ def text_drop():
                     "game": matched_game,
                     "winner_sent_at": match_data[winner]["sent_at"],
                     "winner_timestamp_ms": winner_ms,
+                    "margin_ms": margin_ms,
+                    "resolved": True,
                 }
             ),
             200,
@@ -871,6 +1009,17 @@ def text_drop():
 def get_scoreboard():
     with game_state_lock:
         game_state = load_data()
+
+        current_dt = datetime.now(CHICAGO_TZ)
+
+        game_state = reset_if_new_day(game_state, current_dt.strftime("%Y-%m-%d"))
+
+        finalize_expired_games(game_state, current_dt)
+
+        check_mathematical_elimination(game_state)
+
+        save_data(game_state)
+
     return jsonify(game_state), 200
 
 
